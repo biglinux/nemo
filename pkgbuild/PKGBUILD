@@ -12,7 +12,7 @@ arch=(x86_64)
 url="https://github.com/biglinux/${pkgname}"
 license=(GPL)
 depends=(cinnamon-desktop dconf gvfs exempi libexif libnotify libxml2
-         python xapp)
+         python xapp vte3)
 optdepends=('cinnamon-translations: i18n'
             'ffmpegthumbnailer: support for video thumbnails'
             'catdoc: search helpers support for legacy MS Office files'
