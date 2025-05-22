@@ -73,7 +73,7 @@
 #define MAX_CLICK_TIME 1500
 
 #define INITIAL_UPDATE_VISIBLE_DELAY 300
-#define NORMAL_UPDATE_VISIBLE_DELAY 50
+#define NORMAL_UPDATE_VISIBLE_DELAY 300
 
 /* Button assignments. */
 #define DRAG_BUTTON 1
@@ -671,6 +671,11 @@ set_keyboard_focus (NemoIconContainer *container,
 	g_assert (icon != NULL);
 
 	if (icon == container->details->keyboard_focus) {
+		return;
+	}
+	
+	/* Don't set keyboard focus to non-visible icons */
+	if (!icon->is_visible) {
 		return;
 	}
 
@@ -1494,7 +1499,7 @@ find_best_icon (NemoIconContainer *container,
 	for (p = container->details->icons; p != NULL; p = p->next) {
 		candidate = p->data;
 
-		if (candidate != start_icon) {
+		if (candidate != start_icon && candidate->is_visible) {
 			if ((* function) (container, start_icon, best, candidate, data)) {
 				best = candidate;
 			}
@@ -1516,7 +1521,7 @@ find_best_selected_icon (NemoIconContainer *container,
 	for (p = container->details->icons; p != NULL; p = p->next) {
 		candidate = p->data;
 
-		if (candidate != start_icon && candidate->is_selected) {
+		if (candidate != start_icon && candidate->is_selected && candidate->is_visible) {
 			if ((* function) (container, start_icon, best, candidate, data)) {
 				best = candidate;
 			}
@@ -5771,6 +5776,8 @@ nemo_icon_container_add (NemoIconContainer *container,
 	icon->data = data;
 	icon->x = ICON_UNPOSITIONED_VALUE;
 	icon->y = ICON_UNPOSITIONED_VALUE;
+	icon->is_visible = TRUE; // <<< --- THIS IS THE CRUCIAL FIX FOR INITIAL LAYOUT
+	icon->ok_to_show_thumb = FALSE; // Or based on existing logic for thumbnails
 
 	/* Whether the saved icon position should only be used
 	 * if the previous icon position is free. If the position
@@ -6309,7 +6316,7 @@ get_nth_selected_icon (NemoIconContainer *container, int index)
 	selection_count = 0;
 	for (p = container->details->icons; p != NULL; p = p->next) {
 		icon = p->data;
-		if (icon->is_selected) {
+		if (icon->is_selected && icon->is_visible) {
 			if (++selection_count == index) {
 				return icon;
 			}
@@ -7028,6 +7035,18 @@ nemo_icon_container_get_icon_being_renamed (NemoIconContainer *container)
     g_assert (rename_icon != NULL);
 
     return rename_icon;
+}
+
+NemoIcon *
+nemo_icon_container_lookup_icon_by_file(NemoIconContainer *container,
+                                        NemoFile          *file)
+{
+    g_return_val_if_fail(NEMO_IS_ICON_CONTAINER(container), NULL);
+    g_return_val_if_fail(NEMO_IS_FILE(file), NULL);
+
+    // Use the hash table for O(1) average time lookup
+    return g_hash_table_lookup(container->details->icon_set,
+                               NEMO_ICON_CONTAINER_ICON_DATA(file));
 }
 
 void

@@ -67,6 +67,15 @@ static void find_empty_location (NemoIconContainer *container,
                                  int *x,
                                  int *y);
 
+/* Function to check if icon should be visible in layout based on filter status */
+static gboolean icon_should_be_visible_in_layout (NemoIcon *icon)
+{
+    if (icon == NULL) {
+        return FALSE;
+    }
+    return icon->is_visible;
+}
+
 G_DEFINE_TYPE (NemoIconViewContainer, nemo_icon_view_container, NEMO_TYPE_ICON_CONTAINER);
 
 static GQuark attribute_none_q;
@@ -748,6 +757,23 @@ lay_down_icons_horizontal (NemoIconContainer *container,
     device_canvas_width = floor (canvas_width * ppu);
     icon_size = nemo_get_icon_size_for_zoom_level (container->details->zoom_level);
     text_size = nemo_get_icon_text_width_for_zoom_level (container->details->zoom_level);
+    
+    /* Filter out invisible icons */
+    GList *visible_icons = NULL;
+    for (p = icons; p != NULL; p = p->next) {
+        icon = p->data;
+        if (icon_should_be_visible_in_layout(icon)) {
+            visible_icons = g_list_append(visible_icons, icon);
+        }
+    }
+    
+    /* If there are no visible icons after filtering, return early */
+    if (visible_icons == NULL) {
+        return;
+    }
+    
+    /* Continue with the visible icons only */
+    icons = visible_icons;
 
     use_size = MAX (icon_size, text_size) + 15;
     icon_size /= ppu;
@@ -903,6 +929,23 @@ lay_down_icons_vertical (NemoIconContainer *container,
                  &max_icon_width, &max_icon_height,
                  &max_text_width, &max_text_height,
                  &max_bounds_height);
+                 
+    /* Filter out invisible icons */
+    GList *visible_icons = NULL;
+    for (p = icons; p != NULL; p = p->next) {
+        icon = p->data;
+        if (icon_should_be_visible_in_layout(icon)) {
+            visible_icons = g_list_append(visible_icons, icon);
+        }
+    }
+    
+    /* If there are no visible icons after filtering, return early */
+    if (visible_icons == NULL) {
+        return;
+    }
+    
+    /* Continue with the visible icons only */
+    icons = visible_icons;
 
     max_width = max_icon_width + max_text_width;
     max_height = MAX (max_icon_height, max_text_height);
@@ -1166,7 +1209,6 @@ lay_down_icons_vertical_desktop (NemoIconContainer *container, GList *icons)
      * This should not be tied to the direction of layout.
      * It should be a separate switch.
      */
-    nemo_icon_container_freeze_icon_positions (container);
 }
 
 static void

@@ -40,6 +40,15 @@
 struct NemoWindowDetails
 {
         GtkWidget *statusbar;
+        /* Entry for instant file filtering */
+        GtkWidget *filter_entry;
+        /* Label to display filter results count */
+        GtkWidget *filter_results_label;
+        /* current lowercase filter text */
+        gchar     *filter_text;
+        /* Underlying and filter models for active list view */
+        GtkTreeModel         *orig_model;
+        GtkTreeModelFilter   *filter_model;
         GtkWidget *menubar;
 
         GtkWidget *nemo_status_bar;
@@ -110,6 +119,9 @@ struct NemoWindowDetails
         GList *ignore_meta_column_order;
         gchar *ignore_meta_sort_column;
         gint ignore_meta_sort_direction;
+
+        /* Timer ID for debouncing filter entry changes */
+        guint filter_debounce_timer_id;
 
         gboolean dynamic_menu_entries_current;
 };

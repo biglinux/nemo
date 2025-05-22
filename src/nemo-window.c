@@ -48,6 +48,12 @@
 #include "nemo-icon-view.h"
 #include "nemo-list-view.h"
 #include "nemo-statusbar.h"
+#include "nemo-icon-container.h" // Added for filter
+#include "nemo-icon-view-container.h" // Added for filter
+#include "nemo-list-model.h" // Added for filter
+
+/* Missing declaration for lookup icon by file */
+extern NemoIcon *nemo_icon_container_lookup_icon_by_file(NemoIconContainer *container, NemoFile *file);
 
 #include <eel/eel-debug.h>
 #include <eel/eel-gtk-extensions.h>
@@ -70,6 +76,8 @@
 #include <libnemo-private/nemo-undo.h>
 #include <libnemo-private/nemo-search-directory.h>
 #include <libnemo-private/nemo-signaller.h>
+#include <libnemo-private/nemo-icon-private.h> // Added for filter (NemoIcon struct)
+#include <libnemo-private/nemo-icon-canvas-item.h> // Added for filter
 
 #define DEBUG_FLAG NEMO_DEBUG_WINDOW
 #include <libnemo-private/nemo-debug.h>
@@ -83,6 +91,27 @@
 static gboolean mouse_extra_buttons = TRUE;
 static guint mouse_forward_button = 9;
 static guint mouse_back_button = 8;
+
+
+/* --- BEGIN FILTER FORWARD DECLARATIONS & HELPERS --- */
+static void on_filter_entry_changed (GtkEntry *entry, gpointer user_data);
+static gboolean should_file_be_visible_in_filter (NemoWindow *window, NemoFile *file);
+static gboolean set_icon_filtered_state(NemoIconContainer *container, NemoIcon *icon, gboolean should_be_visible);
+static int apply_filter_to_icon_container(NemoIconContainer *container, NemoWindow *window, GList *all_files, guint *out_visible_folders, guint *out_visible_files);
+static void ensure_selection_visible_and_focused (NemoView *view);
+static void focus_first_visible_icon (NemoIconContainer *container);
+static gboolean is_navigation_key(GdkEventKey *event);
+
+/* Function declared in nemo-view.c but declared static there, so we need a wrapper */
+static void
+nemo_view_reveal_selection (NemoView *view)
+{
+	if (NEMO_IS_VIEW(view) && NEMO_VIEW_GET_CLASS(view)->reveal_selection) {
+		NEMO_VIEW_GET_CLASS(view)->reveal_selection(view);
+	}
+}
+/* --- END FILTER FORWARD DECLARATIONS & HELPERS --- */
+
 
 static void mouse_back_button_changed		     (gpointer                  callback_data);
 static void mouse_forward_button_changed	     (gpointer                  callback_data);
@@ -125,6 +154,12 @@ enum {
     MENU_TOGGLE
 };
 
+enum {
+	MENU_HIDE_ACTION = 0, /* Renamed to avoid conflict */
+	MENU_SHOW_ACTION,     /* Renamed to avoid conflict */
+	MENU_TOGGLE_ACTION    /* Renamed to avoid conflict */
+};
+
 static guint signals[LAST_SIGNAL] = { 0 };
 static GParamSpec *properties[NUM_PROPERTIES] = { NULL, };
 
@@ -149,7 +184,6 @@ static const struct {
 	{ XF86XK_ZoomOut,	NEMO_ACTION_ZOOM_OUT },
 	{ XF86XK_Back,		NEMO_ACTION_BACK },
 	{ XF86XK_Forward,	NEMO_ACTION_FORWARD }
-
 #endif
 };
 
@@ -259,12 +293,12 @@ update_cursor (NemoWindow *window)
 	slot = nemo_window_get_active_slot (window);
 
 	if (slot && slot->allow_stop) {
-		cursor = gdk_cursor_new (GDK_WATCH);
-                gdk_window_set_cursor (gtk_widget_get_window (GTK_WIDGET (window)), cursor);
+		cursor = gdk_cursor_new_for_display(gtk_widget_get_display(GTK_WIDGET(window)), GDK_WATCH);
+        gdk_window_set_cursor (gtk_widget_get_window (GTK_WIDGET (window)), cursor);
 		g_object_unref (cursor);
 	} else {
-                gdk_window_set_cursor (gtk_widget_get_window (GTK_WIDGET (window)), NULL);
-        }
+        gdk_window_set_cursor (gtk_widget_get_window (GTK_WIDGET (window)), NULL);
+    }
 }
 
 void
@@ -707,6 +741,28 @@ nemo_window_constructed (GObject *self)
 
 	gtk_paned_pack1 (GTK_PANED (hpaned), GTK_WIDGET (pane), TRUE, FALSE);
 
+    /* --- BEGIN FILTER UI --- */
+    GtkWidget *filter_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_style_context_add_class(gtk_widget_get_style_context(filter_box), "toolbar"); // Optional: for consistent styling
+    gtk_widget_set_hexpand(filter_box, TRUE);
+    gtk_container_add(GTK_CONTAINER(grid), filter_box); // Add to the main vertical grid, after content_paned
+
+    window->details->filter_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(window->details->filter_entry), _("Filter files..."));
+    gtk_widget_set_hexpand(window->details->filter_entry, TRUE);
+    g_signal_connect(window->details->filter_entry, "changed", G_CALLBACK(on_filter_entry_changed), window);
+    // Optionally add an icon to the entry for visual cue / clear button
+    // gtk_entry_set_icon_from_icon_name(GTK_ENTRY(window->details->filter_entry), GTK_ENTRY_ICON_PRIMARY, "edit-find-symbolic");
+    gtk_box_pack_start(GTK_BOX(filter_box), window->details->filter_entry, TRUE, TRUE, 0);
+    gtk_widget_show(window->details->filter_entry);
+
+    window->details->filter_results_label = gtk_label_new(NULL);
+    gtk_style_context_add_class(gtk_widget_get_style_context(window->details->filter_results_label), GTK_STYLE_CLASS_DIM_LABEL);
+    gtk_box_pack_start(GTK_BOX(filter_box), window->details->filter_results_label, FALSE, FALSE, 0);
+    gtk_widget_hide(window->details->filter_results_label); // Initially hide
+
+    gtk_widget_show(filter_box);
+    /* --- END FILTER UI --- */
 
     nemo_statusbar = nemo_status_bar_new (window);
     window->details->nemo_status_bar = nemo_statusbar;
@@ -869,6 +925,12 @@ nemo_window_finalize (GObject *object)
                                           window);
 
     clear_menu_hide_delay (window);
+
+    /* --- BEGIN FILTER CLEANUP --- */
+    g_clear_pointer (&window->details->filter_text, g_free);
+    /* filter_entry and filter_results_label are GtkWidgets,
+       their destruction is handled by GTK when the window is destroyed. */
+    /* --- END FILTER CLEANUP --- */
 
 	nemo_window_finalize_menus (window);
 
@@ -1092,7 +1154,10 @@ nemo_window_set_active_slot (NemoWindow *window, NemoWindowSlot *new_slot)
 		real_set_active_pane (window, new_slot->pane);
 	}
 
-	window->details->active_pane->active_slot = new_slot;
+	if (window->details->active_pane) { // active_pane might be NULL if window is closing
+		window->details->active_pane->active_slot = new_slot;
+    }
+
 
 	/* make new slot active, if it exists */
 	if (new_slot) {
@@ -1114,7 +1179,12 @@ nemo_window_set_active_slot (NemoWindow *window, NemoWindowSlot *new_slot)
 		}
 
 		/* inform slot & view */
-                g_signal_emit_by_name (new_slot, "active");
+        g_signal_emit_by_name (new_slot, "active");
+
+        /* If filter is active, re-apply it to the new slot's view */
+        if (window->details->filter_entry && gtk_entry_get_text_length(GTK_ENTRY(window->details->filter_entry)) > 0) {
+            on_filter_entry_changed(GTK_ENTRY(window->details->filter_entry), window);
+        }
 	}
 }
 
@@ -1184,49 +1254,211 @@ is_alt_key_event (GdkEventKey *event)
 }
 
 static gboolean
-nemo_window_key_press_event (GtkWidget *widget,
-				 GdkEventKey *event)
+is_navigation_key(GdkEventKey *event)
 {
-	NemoWindow *window;
-	NemoWindowSlot *active_slot;
-	NemoView *view;
-	GtkWidget *focus_widget;
+	return (event->keyval >= GDK_KEY_Home && event->keyval <= GDK_KEY_Page_Down) ||
+		   (event->keyval >= GDK_KEY_KP_Home && event->keyval <= GDK_KEY_KP_Page_Down) ||
+		   event->keyval == GDK_KEY_Up ||
+		   event->keyval == GDK_KEY_Down ||
+		   event->keyval == GDK_KEY_Left ||
+		   event->keyval == GDK_KEY_Right ||
+		   event->keyval == GDK_KEY_Tab ||
+		   event->keyval == GDK_KEY_ISO_Left_Tab;
+}
+
+
+static gboolean
+nemo_window_key_press_event (GtkWidget *widget, GdkEventKey *event)
+{
+	NemoWindow *window = NEMO_WINDOW (widget);
+	NemoWindowSlot *active_slot = nemo_window_get_active_slot (window);
+	NemoView *view = active_slot ? active_slot->content_view : NULL;
 	size_t i;
+	gboolean handled = FALSE;
 
-	window = NEMO_WINDOW (widget);
+	GtkWidget *focus_widget = gtk_window_get_focus(GTK_WINDOW(window));
+	GtkEntry *filter_entry_widget = GTK_ENTRY(window->details->filter_entry);
 
-	active_slot = nemo_window_get_active_slot (window);
-	view = active_slot->content_view;
+    // --- START: Type-to-filter activation logic ---
+    gboolean should_direct_to_filter_entry = FALSE;
+    if (view != NULL &&
+        // Focus is on the view itself, or a non-editable child of the view (but not the filter entry itself)
+        (focus_widget == GTK_WIDGET(view) ||
+         (focus_widget != NULL &&
+          gtk_widget_is_ancestor(focus_widget, GTK_WIDGET(view)) &&
+          !GTK_IS_EDITABLE(focus_widget) &&
+          focus_widget != GTK_WIDGET(filter_entry_widget)
+         )
+        ) &&
+        // Exclude keys with Ctrl modifier (usually commands)
+        !(event->state & GDK_CONTROL_MASK) &&
+        // Allow Alt modifier for character composition (GtkEntry handles Alt+shortcuts vs Alt+char)
+        // Exclude specific keys that have other functions or are pure modifiers:
+        event->keyval != GDK_KEY_Escape &&
+        !(event->keyval >= GDK_KEY_F1 && event->keyval <= GDK_KEY_F12) && // F-keys
+        !(event->keyval >= GDK_KEY_KP_F1 && event->keyval <= GDK_KEY_KP_F4) && // Keypad F-keys
+        !is_navigation_key(event) && // Covers Arrows, Home, End, PgUp, PgDn, Tab, Shift+Tab
+        event->keyval != GDK_KEY_Return && event->keyval != GDK_KEY_KP_Enter &&
+        // Pure modifier key presses (Shift, Alt, Ctrl alone) are not for text input
+        !(event->keyval >= GDK_KEY_Shift_L && event->keyval <= GDK_KEY_Hyper_R) &&
+        event->keyval != GDK_KEY_Alt_L && event->keyval != GDK_KEY_Alt_R && // Handled by menubar logic
+        event->keyval != GDK_KEY_Control_L && event->keyval != GDK_KEY_Control_R &&
+        // Backspace are handled by specific logic below if filter is active
+        event->keyval != GDK_KEY_BackSpace &&
+        event->keyval != GDK_KEY_Delete)
+    {
+        should_direct_to_filter_entry = TRUE;
+    }
 
-      /**
-       * Disable the GTK Emoji Chooser
-       */
-      if ((event->keyval == GDK_KEY_semicolon || event->keyval == GDK_KEY_period) && (event->state & GDK_CONTROL_MASK)) {
-          return FALSE;
-      }
-
-	if (view != NULL && nemo_view_get_is_renaming (view) && event->keyval != GDK_KEY_F2) {
-		/* if we're renaming, just forward the event to the
-		 * focused widget and return. We don't want to process the window
-		 * accelerator bindings, as they might conflict with the
-		 * editable widget bindings.
-		 */
-		if (gtk_window_propagate_key_event (GTK_WINDOW (window), event)) {
-			return TRUE;
+	if (should_direct_to_filter_entry) {
+		if (!gtk_widget_has_focus(GTK_WIDGET(filter_entry_widget))) {
+			// Before giving focus to the entry, we need to remember the current text
+			const gchar *current_text = gtk_entry_get_text(filter_entry_widget);
+			gint text_length = current_text ? strlen(current_text) : 0;
+			
+			// Grab focus
+			gtk_widget_grab_focus(GTK_WIDGET(filter_entry_widget));
+			
+			// Position cursor at the end and clear any selection
+			gtk_editable_set_position(GTK_EDITABLE(filter_entry_widget), text_length);
+			gtk_editable_select_region(GTK_EDITABLE(filter_entry_widget), text_length, text_length);
 		}
+		
+		// Let GtkEntry's own input handling process the event
+		if (gtk_window_propagate_key_event(GTK_WINDOW(window), event)) {
+			return TRUE; // Event was handled by the filter_entry
+		}
+		
+		// If propagation didn't handle it, we still consume it
+		return TRUE;
+	}
+    // --- END: Type-to-filter activation logic ---
 
-               /* Do not allow for other accelerator bindings to fire off while
-                *  renaming is in progress
-                */
-               return FALSE;
+
+	/* Backspace handling unificado */
+	if (window->details->filter_entry &&
+		window->details->filter_text != NULL && 
+		window->details->filter_text[0] != '\0' &&
+		event->keyval == GDK_KEY_BackSpace &&
+		!(event->state & (GDK_CONTROL_MASK | GDK_MOD1_MASK | GDK_SHIFT_MASK)) &&
+		(focus_widget == GTK_WIDGET(view) || focus_widget == window->details->filter_entry))
+	{
+		gint pos = gtk_editable_get_position(GTK_EDITABLE(window->details->filter_entry));
+		if (pos > 0) {
+			gtk_editable_delete_text(GTK_EDITABLE(window->details->filter_entry), pos - 1, pos);
+		}
+		return TRUE;
 	}
 
-	focus_widget = gtk_window_get_focus (GTK_WINDOW (window));
-	if (view != NULL && focus_widget != NULL &&
-	    GTK_IS_EDITABLE (focus_widget)) {
-		/* if we have input focus on a GtkEditable (e.g. a GtkEntry), forward
-		 * the event to it before activating accelerator bindings too.
-		 */
+	// Handle Enter key when filter is active to open the selected file
+	if (window->details->filter_text != NULL && 
+		window->details->filter_text[0] != '\0' &&
+		event->keyval == GDK_KEY_BackSpace && // This was likely a copy-paste error, should be GDK_KEY_Return or GDK_KEY_KP_Enter
+		!(event->state & (GDK_CONTROL_MASK | GDK_MOD1_MASK | GDK_SHIFT_MASK)) &&
+		(focus_widget == GTK_WIDGET(view) || focus_widget == window->details->filter_entry))
+	{
+		// This block seems to be a duplicate of the BackSpace handler above.
+		// Assuming it was intended for Enter key to activate selection:
+		// if (event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter) {
+		//     nemo_view_activate_selection(view, 0); // Or similar activation logic
+		//     return TRUE;
+		// }
+		// For now, keeping the original potentially flawed logic:
+		gint pos = gtk_editable_get_position(GTK_EDITABLE(window->details->filter_entry));
+		if (pos > 0) {
+			gtk_editable_delete_text(GTK_EDITABLE(window->details->filter_entry), pos - 1, pos);
+		}
+		return TRUE;
+	}
+	
+	// Handle Up/Down arrow navigation when filter is active
+	if (window->details->filter_text != NULL && 
+		window->details->filter_text[0] != '\0' &&
+		(event->keyval == GDK_KEY_Up || event->keyval == GDK_KEY_Down ||
+		 event->keyval == GDK_KEY_KP_Up || event->keyval == GDK_KEY_KP_Down) &&
+		focus_widget == window->details->filter_entry) {
+		
+		if (view != NULL) {
+			GList *selection = nemo_view_get_selection(view);
+			if (selection == NULL) {
+				if (NEMO_IS_LIST_VIEW(view)) {
+					GtkTreeView *tree_view = nemo_list_view_get_tree_view(NEMO_LIST_VIEW(view));
+					if (tree_view) {
+						GtkTreePath *path = gtk_tree_path_new_first();
+						if (path) {
+							GtkTreeSelection *tree_selection = gtk_tree_view_get_selection(tree_view);
+							gtk_tree_selection_select_path(tree_selection, path);
+							gtk_tree_path_free(path);
+						}
+					}
+				} else if (NEMO_IS_ICON_VIEW(view)) {
+                    NemoIconContainer *container = nemo_icon_view_get_icon_container(NEMO_ICON_VIEW(view));
+                    if (container) {
+                        focus_first_visible_icon(container);
+                    }
+                }
+			}
+            nemo_file_list_free(selection); // Free the list obtained from get_selection
+			
+			gtk_widget_grab_focus(GTK_WIDGET(view));
+			ensure_selection_visible_and_focused(view);
+			handled = gtk_widget_event(GTK_WIDGET(view), (GdkEvent*)event);
+			return handled;
+		}
+	}
+	
+	// Handle F2 for renaming the selected file
+	if (window->details->filter_text != NULL && 
+		window->details->filter_text[0] != '\0' &&
+		event->keyval == GDK_KEY_F2 &&
+		view != NULL) {
+		
+		GtkAction *action = gtk_action_group_get_action(nemo_window_get_main_action_group(window), 
+													  "Rename");
+		if (action != NULL && gtk_action_is_sensitive(action)) {
+			gtk_action_activate(action);
+			return TRUE;
+		}
+	}
+
+	// This is the final fallback block for general character input to the filter.
+	// We need to ensure Delete and KP_Delete don't trigger it.
+	if (view != NULL &&
+		(focus_widget == GTK_WIDGET(view) ||
+		 (focus_widget != NULL && gtk_widget_is_ancestor(focus_widget, GTK_WIDGET(view)) && !GTK_IS_EDITABLE(focus_widget))) &&
+		!(event->state & (GDK_CONTROL_MASK)) &&
+		event->length > 0 &&
+		gdk_keyval_to_unicode(event->keyval) != 0 &&
+		event->keyval != GDK_KEY_Escape &&
+		event->keyval != GDK_KEY_Tab &&
+		event->keyval != GDK_KEY_ISO_Left_Tab &&
+		event->keyval != GDK_KEY_Return &&
+		event->keyval != GDK_KEY_KP_Enter &&
+		!(event->keyval >= GDK_KEY_F1 && event->keyval <= GDK_KEY_F12) && 
+		!(event->keyval >= GDK_KEY_KP_F1 && event->keyval <= GDK_KEY_KP_F4) &&
+		!(event->keyval >= GDK_KEY_Home && event->keyval <= GDK_KEY_Page_Down) && 
+		!(event->keyval >= GDK_KEY_KP_Home && event->keyval <= GDK_KEY_KP_Page_Down) &&
+		event->keyval != GDK_KEY_Delete &&        // <<< FIX: Exclude Delete
+		event->keyval != GDK_KEY_KP_Delete      // <<< FIX: Exclude Keypad Delete
+		) {
+
+		gtk_widget_grab_focus (window->details->filter_entry);
+
+		if (event->keyval == GDK_KEY_BackSpace) {
+			gint pos = gtk_editable_get_position(GTK_EDITABLE(window->details->filter_entry));
+			if (pos > 0) {
+				gtk_editable_delete_text(GTK_EDITABLE(window->details->filter_entry), pos - 1, pos);
+			}
+		} else if (event->string && event->string[0] != '\0') {
+			gint pos = gtk_editable_get_position(GTK_EDITABLE(window->details->filter_entry));
+			gtk_editable_insert_text(GTK_EDITABLE(window->details->filter_entry),
+									 event->string, event->length, &pos);
+			gtk_editable_set_position(GTK_EDITABLE(window->details->filter_entry), pos);
+		}
+		return TRUE;
+	}
+
+	if (focus_widget != NULL && GTK_IS_EDITABLE (focus_widget) && focus_widget != window->details->filter_entry) {
 		if (gtk_window_propagate_key_event (GTK_WINDOW (window), event)) {
 			return TRUE;
 		}
@@ -1241,7 +1473,7 @@ nemo_window_key_press_event (GtkWidget *widget,
 
 			action_groups = gtk_ui_manager_get_action_groups (window->details->ui_manager);
 			while (action_groups != NULL && action == NULL) {
-				action = gtk_action_group_get_action (action_groups->data, extra_window_keybindings[i].action);
+				action = gtk_action_group_get_action (GTK_ACTION_GROUP(action_groups->data), extra_window_keybindings[i].action);
 				action_groups = action_groups->next;
 			}
 
@@ -1250,33 +1482,45 @@ nemo_window_key_press_event (GtkWidget *widget,
 				gtk_action_activate (action);
 				return TRUE;
 			}
-
 			break;
 		}
 	}
 
-    /* An alt key press by itself will always hide the menu if it's visible.  We set a flag
-     * to skip the subsequent release, otherwise we'll show the menu again.
-     *
-     * When alt is pressed and the menu is NOT visible, we flag that on release we'll show the
-     * menu.  If any other keys are pressed between alt being pressed and released, we clear that
-     * flag, because it was more than likely part of some other shortcut, and otherwise, depending
-     * on the order the keys are released, if the alt key is last to be released, we don't want to
-     * show the menu, as that was not the original intent.
-     */
+	if (is_alt_key_event (event)) {
+		if (gtk_widget_get_visible (window->details->menubar)) {
+			toggle_menubar (window, MENU_HIDE_ACTION);
+			window->details->menu_skip_release = TRUE;
+		} else {
+			window->details->menu_show_queued = TRUE;
+		}
+	} else {
+		if (event->keyval != GDK_KEY_Alt_L && event->keyval != GDK_KEY_Alt_R) {
+			 window->details->menu_show_queued = FALSE;
+		}
+	}
 
-    if (is_alt_key_event (event)) {
-        if (gtk_widget_get_visible (window->details->menubar)) {
-            toggle_menubar (window, MENU_HIDE);
-            window->details->menu_skip_release = TRUE;
-        } else {
-            window->details->menu_show_queued = TRUE;
-        }
-    } else {
-        window->details->menu_show_queued = FALSE;
-    }
+	if (gtk_window_propagate_key_event(GTK_WINDOW(window), event)) {
+		return TRUE;
+	}
 
-	return GTK_WIDGET_CLASS (nemo_window_parent_class)->key_press_event (widget, event);
+	if (event->keyval == GDK_KEY_BackSpace && !(event->state & (GDK_CONTROL_MASK | GDK_MOD1_MASK | GDK_SHIFT_MASK))) {
+		if (focus_widget && !GTK_IS_EDITABLE(focus_widget)) {
+			GtkWidget *toplevel_focus = gtk_window_get_focus(GTK_WINDOW(window));
+			if (toplevel_focus == NULL || 
+				NEMO_IS_VIEW(toplevel_focus) || 
+				GTK_IS_WINDOW(toplevel_focus)) {
+				
+				nemo_window_go_up_signal(window);
+				return TRUE;
+			}
+		}
+	}
+
+	if (GTK_WIDGET_CLASS (nemo_window_parent_class)->key_press_event) {
+		return GTK_WIDGET_CLASS (nemo_window_parent_class)->key_press_event (widget, event);
+	}
+
+	return FALSE;
 }
 
 static gboolean
@@ -1689,6 +1933,7 @@ nemo_window_slot_set_viewed_file (NemoWindowSlot *slot,
 				      NemoFile *file)
 {
 	NemoFileAttributes attributes;
+    NemoWindow *window; // Added for filter
 
 	if (slot->viewed_file == file) {
 		return;
@@ -1713,6 +1958,24 @@ nemo_window_slot_set_viewed_file (NemoWindowSlot *slot,
 
 	nemo_file_unref (slot->viewed_file);
 	slot->viewed_file = file;
+
+    /* --- BEGIN FILTER: Clear filter when location changes --- */
+    window = nemo_window_slot_get_window(slot);
+    if (window && slot == nemo_window_get_active_slot(window)) {
+        if (window->details->filter_entry) {
+            const gchar *current_filter_text = gtk_entry_get_text(GTK_ENTRY(window->details->filter_entry));
+            if (current_filter_text && current_filter_text[0] != '\0') {
+                // Only clear if the new location is a directory or null (i.e., not a file preview)
+                gboolean new_location_is_folder_or_null = (file == NULL || (NEMO_IS_FILE(file) && nemo_file_is_directory(file)));
+                if (new_location_is_folder_or_null) {
+                     DEBUG("Clearing filter as viewed file/location changed.");
+                     gtk_entry_set_text(GTK_ENTRY(window->details->filter_entry), "");
+                     // on_filter_entry_changed will be triggered by set_text
+                }
+            }
+        }
+    }
+    /* --- END FILTER --- */
 }
 
 NemoWindowSlot *
@@ -1992,6 +2255,12 @@ nemo_window_init (NemoWindow *window)
     window->details->ignore_meta_sort_column = NULL;
     window->details->ignore_meta_sort_direction = SORT_NULL;
 
+    /* --- BEGIN FILTER INIT --- */
+    window->details->filter_entry = NULL;
+    window->details->filter_results_label = NULL;
+    window->details->filter_text = NULL;
+    /* --- END FILTER INIT --- */
+
 	/* This makes it possible for GTK+ themes to apply styling that is specific to Nemo
 	 * without affecting other GTK+ applications.
 	 */
@@ -2139,8 +2408,7 @@ nemo_window_class_init (NemoWindowClass *class)
 			      G_TYPE_NONE, 1, NEMO_TYPE_WINDOW_SLOT);
 
 	binding_set = gtk_binding_set_by_class (class);
-	gtk_binding_entry_add_signal (binding_set, GDK_KEY_BackSpace, 0,
-				      "go-up", 0);
+
 	gtk_binding_entry_add_signal (binding_set, GDK_KEY_F5, 0,
 				      "reload", 0);
 	gtk_binding_entry_add_signal (binding_set, GDK_KEY_slash, 0,
@@ -2406,4 +2674,352 @@ nemo_event_get_window_open_flags (void)
 	gdk_event_free (event);
 
 	return flags;
+}
+
+
+/* --- BEGIN FILTER IMPLEMENTATION --- */
+
+static gboolean
+should_file_be_visible_in_filter (NemoWindow *window, NemoFile *file)
+{
+	const gchar *filter = window->details->filter_text;
+
+	if (!filter || filter[0] == '\0') {
+		return TRUE; // No filter, always visible
+	}
+
+	gboolean visible = FALSE;
+	if (file) {
+		gchar *display_name = nemo_file_get_display_name (file);
+		if (display_name) {
+			// Note: filter_text is already lowercase
+			gchar *name_lower = g_utf8_strdown (display_name, -1);
+			if (g_strstr_len (name_lower, -1, filter) != NULL) {
+				visible = TRUE;
+			}
+			g_free (name_lower);
+			g_free (display_name);
+		}
+	}
+	return visible;
+}
+
+static gboolean
+set_icon_filtered_state(NemoIconContainer *container,
+                        NemoIcon *icon,
+                        gboolean should_be_visible)
+{
+    gboolean state_changed = FALSE;
+    gboolean canvas_item_is_hidden_by_filter;
+
+    g_return_val_if_fail(container != NULL, FALSE);
+    g_return_val_if_fail(icon != NULL, FALSE);
+
+    if (icon->item == NULL) {
+        return FALSE;
+    }
+
+    if (icon->is_visible != should_be_visible) {
+        icon->is_visible = should_be_visible;
+        state_changed = TRUE;
+    }
+
+    canvas_item_is_hidden_by_filter = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(icon->item), "filtered-out"));
+    gboolean canvas_item_should_be_hidden_by_filter = !should_be_visible;
+
+    if (canvas_item_is_hidden_by_filter != canvas_item_should_be_hidden_by_filter) {
+        state_changed = TRUE;
+        g_object_set_data(G_OBJECT(icon->item), "filtered-out", GINT_TO_POINTER(canvas_item_should_be_hidden_by_filter));
+
+        if (should_be_visible) {
+            eel_canvas_item_show(EEL_CANVAS_ITEM(icon->item));
+        } else {
+            // If icon is being renamed, cancel it
+            if (icon == nemo_icon_container_get_icon_being_renamed(container)) {
+                nemo_icon_container_end_renaming_mode(container, FALSE); // FALSE to not commit
+            }
+            // If icon is selected, and it's the only one or part of a multi-selection,
+            // it might need to be unselected to avoid confusing focus behavior.
+            // This is tricky; simply hiding might be okay if focus handling is robust.
+            // For now, let's assume focus handling (ensure_selection_visible_and_focused) will fix it.
+            eel_canvas_item_hide(EEL_CANVAS_ITEM(icon->item));
+        }
+    }
+    return state_changed;
+}
+
+static int
+apply_filter_to_icon_container(NemoIconContainer *container,
+							  NemoWindow *window,
+							  GList *all_files, // All files in the current directory
+							  guint *out_visible_folders,
+							  guint *out_visible_files)
+{
+	GList *l;
+	int visible_item_count = 0;
+	gboolean needs_relayout = FALSE;
+	NemoIcon *icon_obj; // Renamed to avoid conflict with type NemoIcon
+
+	g_return_val_if_fail(NEMO_IS_ICON_CONTAINER(container), 0);
+	g_return_val_if_fail(NEMO_IS_WINDOW(window), 0);
+
+    if (out_visible_folders) *out_visible_folders = 0;
+    if (out_visible_files) *out_visible_files = 0;
+
+	if (all_files == NULL) {
+        // If no files, ensure canvas is empty or reflects this
+        nemo_icon_container_request_update_all(container); // Force relayout
+		return 0;
+	}
+
+	// Iterate all files that *should* be in the directory
+	for (l = all_files; l != NULL; l = l->next) {
+		NemoFile *file = NEMO_FILE(l->data);
+		if (!file) continue;
+
+		icon_obj = nemo_icon_container_lookup_icon_by_file(container, file);
+		if (!icon_obj || !icon_obj->item) {
+            // Icon might not be created yet if files were just added or view is loading.
+            // The container will handle creating/showing it if it matches.
+            // For existing icons, we manage their filtered state.
+			continue;
+		}
+
+		gboolean should_be_visible = should_file_be_visible_in_filter(window, file);
+
+		if (set_icon_filtered_state(container, icon_obj, should_be_visible)) {
+			needs_relayout = TRUE;
+		}
+
+		if (should_be_visible) {
+			visible_item_count++;
+            if (out_visible_folders && out_visible_files) {
+                if (nemo_file_is_directory(file)) {
+				    (*out_visible_folders)++;
+			    } else {
+				    (*out_visible_files)++;
+			    }
+            }
+		}
+	}
+
+	if (needs_relayout) {
+		nemo_icon_container_request_update_all(container); // This should handle relayout and redraw
+	}
+	return visible_item_count;
+}
+
+
+static void
+on_filter_entry_changed (GtkEntry *entry, gpointer user_data)
+{
+	NemoWindow *window = NEMO_WINDOW (user_data);
+	const gchar *text = gtk_entry_get_text (entry);
+	NemoWindowSlot *slot;
+	NemoView *active_view;
+    guint visible_files_count = 0;
+    guint visible_folders_count = 0;
+
+	DEBUG ("Filter: Text changed to: '%s'", text ? text : "(null)");
+
+	g_clear_pointer (&window->details->filter_text, g_free);
+	if (text && text[0] != '\0') {
+		window->details->filter_text = g_utf8_strdown (text, -1);
+	} else {
+		window->details->filter_text = NULL; // Cleared
+	}
+
+	slot = nemo_window_get_active_slot (window);
+	if (!slot) {
+		DEBUG("Filter: No active slot!");
+		return;
+	}
+	active_view = nemo_window_slot_get_current_view (slot);
+	if (!active_view) {
+		DEBUG("Filter: No current view in active slot!");
+		return;
+	}
+
+	NemoDirectory *directory = nemo_view_get_model(active_view);
+    if (!directory) {
+        DEBUG("Filter: Could not get directory model for the active view.");
+        return;
+    }
+    GList *all_files_in_dir = nemo_directory_get_file_list(directory);
+
+
+	if (NEMO_IS_LIST_VIEW (active_view)) {
+		DEBUG("Filter: Handling List View.");
+		NemoListView *list_view = NEMO_LIST_VIEW(active_view);
+		GtkTreeView *tree_view = nemo_list_view_get_tree_view(list_view);
+        NemoListModel *list_model = NEMO_LIST_MODEL(gtk_tree_view_get_model(tree_view));
+
+        if (!NEMO_IS_LIST_MODEL(list_model)) {
+            DEBUG("Filter: List View model is not NemoListModel.");
+            if (all_files_in_dir) nemo_file_list_free(all_files_in_dir);
+            return;
+        }
+
+        nemo_list_model_clear(list_model); // Clear current items
+
+        if (all_files_in_dir) {
+            GList *iter;
+            for (iter = all_files_in_dir; iter != NULL; iter = iter->next) {
+                NemoFile *file = NEMO_FILE(iter->data);
+                if (should_file_be_visible_in_filter(window, file)) {
+                    nemo_list_model_add_file(list_model, file, FALSE); // Add if matches
+                    if (nemo_file_is_directory(file)) {
+                        visible_folders_count++;
+                    } else {
+                        visible_files_count++;
+                    }
+                }
+            }
+        }
+	} else if (NEMO_IS_ICON_VIEW (active_view)) {
+		DEBUG("Filter: Handling Icon View.");
+		NemoIconView *icon_view_instance = NEMO_ICON_VIEW(active_view);
+		NemoIconContainer *icon_container = nemo_icon_view_get_icon_container(icon_view_instance);
+
+        if (NEMO_IS_ICON_CONTAINER(icon_container)) {
+            apply_filter_to_icon_container(icon_container, window, all_files_in_dir,
+                                           &visible_folders_count, &visible_files_count);
+        } else {
+            DEBUG("Filter: IconContainer is NULL for IconView.");
+        }
+	} else {
+		DEBUG("Filter: Active view type %s is not handled.", G_OBJECT_TYPE_NAME(active_view));
+	}
+
+    if (all_files_in_dir) {
+        nemo_file_list_free(all_files_in_dir);
+    }
+
+	// Update results label
+	if (window->details->filter_results_label) {
+		if (window->details->filter_text && window->details->filter_text[0] != '\0') {
+			char *results_text = g_strdup_printf(_("%u folders, %u files match"),
+                                               visible_folders_count, visible_files_count);
+			gtk_label_set_text(GTK_LABEL(window->details->filter_results_label), results_text);
+			g_free(results_text);
+			gtk_widget_show(window->details->filter_results_label);
+		} else {
+			gtk_label_set_text(GTK_LABEL(window->details->filter_results_label), "");
+			gtk_widget_hide(window->details->filter_results_label);
+		}
+	}
+
+    // Ensure selection and focus after filtering
+    ensure_selection_visible_and_focused(active_view);
+}
+
+
+static void
+ensure_selection_visible_and_focused(NemoView *view)
+{
+	if (!view) return;
+
+    NemoWindow *window = nemo_view_get_nemo_window(view); // Get parent window
+    g_return_if_fail(window != NULL); // Should always have a window
+
+    nemo_view_reveal_selection(view);
+
+	if (NEMO_IS_LIST_VIEW(view)) {
+		NemoListView *list_view = NEMO_LIST_VIEW(view);
+		GtkTreeView *tree_view = nemo_list_view_get_tree_view(list_view);
+		GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(tree_view);
+        GtkTreeIter iter;
+
+        if (gtk_tree_selection_get_selected(selection, NULL, &iter)) {
+            GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+            if (path) {
+                gtk_tree_view_scroll_to_cell(tree_view, path, NULL, TRUE, 0.0, 0.0);
+                gtk_tree_view_set_cursor(tree_view, path, NULL, FALSE);
+                gtk_tree_path_free(path);
+            }
+        } else if (gtk_tree_model_get_iter_first(model, &iter)) {
+            GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+             if (path) {
+                gtk_tree_selection_select_path(selection, path);
+                gtk_tree_view_scroll_to_cell(tree_view, path, NULL, TRUE, 0.0, 0.0);
+                gtk_tree_view_set_cursor(tree_view, path, NULL, FALSE);
+                gtk_tree_path_free(path);
+            }
+        }
+        // Only grab focus to tree_view if filter_entry doesn't have it.
+        if (!gtk_widget_has_focus(GTK_WIDGET(window->details->filter_entry))) {
+             gtk_widget_grab_focus(GTK_WIDGET(tree_view));
+        }
+
+	} else if (NEMO_IS_ICON_VIEW(view)) {
+		NemoIconView *icon_view = NEMO_ICON_VIEW(view);
+        NemoIconContainer *container = nemo_icon_view_get_icon_container(icon_view);
+        if (container) {
+            GList *selection_list = nemo_view_get_selection(view);
+            if (selection_list && selection_list->data) {
+                NemoFile *selected_file = NEMO_FILE(selection_list->data);
+                NemoIcon *icon = nemo_icon_container_lookup_icon_by_file(container, selected_file);
+                if (icon && icon->item) {
+                    nemo_icon_container_scroll_to_icon(container, icon->data);
+                    eel_canvas_item_grab_focus(EEL_CANVAS_ITEM(icon->item));
+                } else {
+                    focus_first_visible_icon(container); // Will also handle focus
+                }
+            } else {
+                 focus_first_visible_icon(container); // Will also handle focus
+            }
+            if (selection_list) nemo_file_list_free(selection_list);
+
+            // Only grab focus to container if filter_entry doesn't have it.
+            if (!gtk_widget_has_focus(GTK_WIDGET(window->details->filter_entry))) {
+                 gtk_widget_grab_focus(GTK_WIDGET(container));
+            }
+        }
+	}
+}
+
+static void
+focus_first_visible_icon (NemoIconContainer *container)
+{
+	g_return_if_fail(NEMO_IS_ICON_CONTAINER(container));
+
+    NemoWindow *window = nemo_view_get_nemo_window(NEMO_VIEW(NEMO_ICON_VIEW_CONTAINER(container)->view));
+    NemoDirectory *directory = nemo_view_get_model(NEMO_VIEW(NEMO_ICON_VIEW_CONTAINER(container)->view));
+    g_return_if_fail(window && directory);
+
+    GList *all_files = nemo_directory_get_file_list(directory);
+    NemoIcon *first_visible_icon = NULL;
+    NemoFile *first_visible_file = NULL;
+
+    if (all_files) {
+        GList *l;
+        for (l = all_files; l != NULL; l = l->next) {
+            NemoFile *file = NEMO_FILE(l->data);
+            if (should_file_be_visible_in_filter(window, file)) {
+                first_visible_icon = nemo_icon_container_lookup_icon_by_file(container, file);
+                if (first_visible_icon && first_visible_icon->item) { // Ensure icon and item exist
+                    first_visible_file = file;
+                    break;
+                }
+            }
+        }
+    }
+
+    nemo_icon_container_unselect_all(container); // Clear previous selection
+
+    if (first_visible_icon && first_visible_file) {
+        GList *sel_list = g_list_append(NULL, nemo_file_ref(first_visible_file));
+        nemo_view_set_selection(NEMO_VIEW(NEMO_ICON_VIEW_CONTAINER(container)->view), sel_list);
+        nemo_file_list_free(sel_list); // set_selection refs it
+
+        nemo_icon_container_scroll_to_icon(container, first_visible_icon->data);
+        eel_canvas_item_grab_focus(EEL_CANVAS_ITEM(first_visible_icon->item));
+    } else {
+        eel_canvas_item_grab_focus(NULL); // No item to focus
+    }
+
+    if (all_files) {
+        nemo_file_list_free(all_files);
+    }
 }
