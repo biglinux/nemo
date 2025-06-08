@@ -104,7 +104,7 @@ if enableEmptyView
 endif
 
 nemo_deps = [ cinnamon, gail, glib, gtk, math,
-  egg, nemo_extension, nemo_private, xapp, vte ]
+  egg, nemo_extension, nemo_private, xapp, vte, jemalloc ]
 
 if exempi_enabled
   nemo_deps += exempi
@@ -119,6 +119,7 @@ nemo = executable('nemo',
   include_directories: [ rootInclude ],
   c_args: nemo_definitions,
   dependencies: nemo_deps,
+  link_args: ['-Wl,--no-as-needed', '-ljemalloc', '-Wl,--as-needed'],
   install: true
 )
 
@@ -127,6 +128,7 @@ nemoDesktop = executable('nemo-desktop',
   include_directories: [ rootInclude],
   c_args: nemo_definitions,
   dependencies: nemo_deps,
+  link_args: ['-Wl,--no-as-needed', '-ljemalloc', '-Wl,--as-needed'],
   install: true
 )
 
